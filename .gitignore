@@ -2,3 +2,4 @@ target/
 bench/node_modules/
 bench/results/
 .DS_Store
+bench/tools/

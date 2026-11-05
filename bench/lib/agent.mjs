@@ -17,6 +17,17 @@ export function prompt(task, space, door) {
       `When you're done, call finish and end your reply with one line: FINAL: <the answer, or "done">.`,
     ].join("\n");
   }
+  // The other tools: an MCP server or a command line, with nothing but its own instructions.
+  if (door === "server" || door === "cli") {
+    return [
+      door === "server" ? "Use the browser through your browser tools." : `Use the browser through the \`${space.tool}\` command, as your system prompt describes.`,
+      `Start at ${task.url}`,
+      ``,
+      `Task: ${task.goal}`,
+      ``,
+      `When you're done, close the browser and end your reply with one line: FINAL: <the answer, or "done">.`,
+    ].join("\n");
+  }
   const how = door === "mcp"
     ? "Use the browser through the `run` tool: it runs one script exactly as `ego-browser nodejs` would, as your system prompt describes, and returns its output."
     : "Use the browser through the `ego-browser nodejs` command, as your system prompt describes.";
@@ -35,11 +46,16 @@ export function runAgent({ task, space, model, skill, binDir, door = "bash", bro
   const cwd = mkdtempSync(join(tmpdir(), "alter-bench-"));
   writeFileSync(join(cwd, "skill.md"), skill || "");
   // A gate can keep a tool call open while a person answers; give MCP calls room for that.
-  const env = { ...process.env, PATH: `${binDir}:${process.env.PATH}`, MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT || "900000" };
+  const env = { ...process.env, ...(door === "cli" ? browser.env : {}), PATH: `${browser.bin ? `${browser.bin}:` : ""}${binDir}:${process.env.PATH}`, MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT || "900000" };
   delete env.CLAUDECODE;
   // bash: the agent runs `ego-browser nodejs` itself. mcp: one `run` tool does it (lib/mcp-script.mjs).
   // alter: the engine's own door; its tool descriptions are the whole skill.
-  const tools = door === "alter"
+  const tools = door === "server"
+    ? ["--tools", "", "--allowedTools", "mcp__web",
+       "--mcp-config", JSON.stringify({ mcpServers: { web: { command: browser.server.command, args: browser.server.args, env: { PATH: env.PATH, HOME: process.env.HOME, ...browser.env } } } })]
+    : door === "cli"
+    ? ["--tools", "Bash,Read", "--allowedTools", `Bash(${browser.command}:*)`, "Read"]
+    : door === "alter"
     ? ["--tools", "", "--allowedTools", "mcp__alter__act", "mcp__alter__look", "mcp__alter__finish",
        "--mcp-config", JSON.stringify({ mcpServers: { alter: { command: browser.mcp, args: [], env: { HOME: process.env.HOME, ALTER_TASK: space, ...browser.env } } } })]
     : door === "mcp"
@@ -47,7 +63,7 @@ export function runAgent({ task, space, model, skill, binDir, door = "bash", bro
        "--mcp-config", JSON.stringify({ mcpServers: { browser: { command: process.execPath, args: [join(import.meta.dirname, "mcp-script.mjs")], env: { PATH: env.PATH, HOME: process.env.HOME } } } })]
     : ["--tools", "Bash,Read", "--allowedTools", "Bash(ego-browser:*)", "Read"];
   const args = [
-    "-p", prompt(task, space, door),
+    "-p", prompt(task, door === "cli" ? { tool: browser.command } : space, door),
     "--output-format", "stream-json", "--verbose",
     "--model", model,
     ...tools,
@@ -93,7 +109,9 @@ export function runAgent({ task, space, model, skill, binDir, door = "bash", bro
     child.on("close", (code) => {
       clearTimeout(timer);
       const u = result?.usage || {};
-      const browserCalls = calls.filter((c) => c.tool === "Bash" || c.tool === "mcp__browser__run" || c.tool?.startsWith("mcp__alter__"));
+      const browserCalls = calls.filter((c) => c.tool === "Bash" || c.tool === "mcp__browser__run" || c.tool?.startsWith("mcp__alter__") || c.tool?.startsWith("mcp__web__")
+        // Some command lines write a page to a file for the agent to read: that's browser output too.
+        || (door === "cli" && c.tool === "Read"));
       done({
         exitCode: code,
         timedOut: !result,

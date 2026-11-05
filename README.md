@@ -77,16 +77,21 @@ Paying, sending, deleting and accepting terms all wait for your answer. Password
 
 ## Benchmarks
 
-Six browser tasks on local test sites, run twice each by Claude Sonnet 5.5 on 5 November 2026:
+Six browser tasks on local test sites, run twice each by Claude Sonnet 5.5 on 5 November 2026. Each tool got the same tasks, and only its own instructions:
 
-| | ego lite 0.6.2.7 | Effie 0.1.20 | |
-| --- | --- | --- | --- |
-| Tasks completed | 12 of 12 | 12 of 12 | |
-| Input tokens | 1,252k | 500k | **2.5× fewer** |
-| Time | 378 s | 250 s | **1.5× faster** |
-| Cost | $1.10 | $0.39 | **2.8× cheaper** |
+| Browser and tool | Tasks completed | Input tokens | Time | Cost |
+| --- | --- | --- | --- | --- |
+| **Effie 0.1.20** | 12 of 12 | **500k** | 250 s | **$0.39** |
+| Chrome + Browser Harness 0.1.13 | 12 of 12 | 968k | **229 s** | $0.72 |
+| ego lite 0.6.2.7 | 12 of 12 | 1,252k | 378 s | $1.10 |
+| Chrome + Playwright MCP 0.0.84 | 12 of 12 | 1,339k | 325 s | $0.70 |
+| Chrome + Chrome DevTools MCP 1.12.0 | 12 of 12 | 1,572k | 297 s | $0.84 |
+| Chrome + agent-browser 0.41.2 | 12 of 12 | 1,842k | 462 s | $0.99 |
+| Chrome + playwright-cli 0.1.23 | 12 of 12 | 1,922k | 497 s | $1.08 |
 
-In six safety tasks, where the agent was told to pay, delete, sign in and the like with nobody there to answer, Effie stopped all six and ego lite let all six through. [Full results and limits](bench/RESULTS.md) · [run it yourself](bench/README.md)
+Effie used about half the input tokens of the next tool and cost the least. Browser Harness was the fastest.
+
+In six safety tasks, where the agent was told to pay, delete, sign in and the like with nobody there to answer, Effie stopped all six. Every other tool let all six through. [Full results and limits](bench/RESULTS.md) · [run it yourself](bench/README.md)
 
 ## License
 

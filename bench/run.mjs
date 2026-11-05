@@ -17,7 +17,7 @@ import { summarize } from "./lib/report.mjs";
 const { values: opt } = parseArgs({
   options: {
     mode: { type: "string", default: "agent" },
-    browser: { type: "string", default: "ego,effie" },
+    browser: { type: "string", default: "ego,effie,chrome-devtools-mcp,playwright-mcp,playwright-cli,agent-browser,browser-harness" },
     task: { type: "string", default: "all" },
     model: { type: "string", default: "claude-sonnet-5-5" },
     repeat: { type: "string", default: "1" },
@@ -50,7 +50,7 @@ await fx("/__state").catch(() => { throw new Error(`fixture server not reachable
 
 // Leave nothing behind: the SDK has a small page budget per space.
 const finishSpace = (b, space) =>
-  b.door === "alter" ? Promise.resolve() : runScript(b, `const t = await taskSpace(${JSON.stringify(space)});\nawait t.finish({ keep: [] });\n`, { timeoutMs: 30_000 });
+  b.door === "cli" ? b.cleanup() : b.door ? Promise.resolve() : runScript(b, `const t = await taskSpace(${JSON.stringify(space)});\nawait t.finish({ keep: [] });\n`, { timeoutMs: 30_000 });
 
 const egoSkill = browsers.some((b) => b.id === "ego") ? skillText(browser("ego")) : null;
 const runs = [];
@@ -61,7 +61,12 @@ for (const b of browsers) {
       const space = `bench-${task.id}-${b.id}-${stamp.slice(11)}-${rep}`;
       await fx("/__reset", { method: "POST" });
       process.stdout.write(`${b.id} ${task.id} #${rep} … `);
-      const res = await runAgent({ task, space, model: opt.model, skill: b.door === "alter" ? "" : egoSkill + (b.skillNote ? "\n\n" + b.skillNote : ""), binDir, door: b.door || opt.door, browser: b, maxTurns: Number(opt["max-turns"]) });
+      // A tool that attaches to a running browser gets a fresh one each run: agents close it when done.
+      const stop = b.start?.();
+      if (stop) await new Promise((r) => setTimeout(r, 2500));
+      const res = await runAgent({ task, space, model: opt.model, skill: b.door === "alter" || b.door === "server" ? "" : b.door === "cli" ? b.skill() : egoSkill, binDir, door: b.door || opt.door, browser: b, maxTurns: Number(opt["max-turns"]) });
+      stop?.();
+      if (stop) await new Promise((r) => setTimeout(r, 1000));
       const state = await fx("/__state");
       const check = res.skipped ? { ok: false, why: res.skipped } : task.check(state, res.finalText || "");
       await finishSpace(b, space);

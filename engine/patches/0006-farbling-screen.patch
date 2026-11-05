@@ -1,0 +1,123 @@
+diff --git a/third_party/blink/renderer/core/events/mouse_event.cc b/third_party/blink/renderer/core/events/mouse_event.cc
+index 19f0f66095..044b496351 100644
+--- a/third_party/blink/renderer/core/events/mouse_event.cc
++++ b/third_party/blink/renderer/core/events/mouse_event.cc
+@@ -20,6 +20,7 @@
+  * Boston, MA 02110-1301, USA.
+  */
+ 
++#include "third_party/blink/renderer/core/frame/alter_farbling.h"
+ #include "third_party/blink/renderer/core/events/mouse_event.h"
+ 
+ #include "third_party/blink/public/common/input/web_pointer_properties.h"
+@@ -216,6 +217,11 @@ void MouseEvent::SetCoordinatesFromWebPointerProperties(
+         frame->View()->ConvertFromRootFrame(root_frame_point);
+     inverse_zoom_factor = 1.0f / frame->LayoutZoomFactor();
+     client_point = gfx::ScalePoint(frame_point, inverse_zoom_factor);
++    // Alter: screen positions as if the window sat at the screen's corner, as
++    // window.screenX/Y say, so they can't give its real place away.
++    if (AlterFarbling::From(const_cast<LocalDOMWindow*>(dom_window))) {
++      screen_point = root_frame_point;
++    }
+   }
+ 
+   initializer->setScreenX(screen_point.x());
+diff --git a/third_party/blink/renderer/core/frame/screen.cc b/third_party/blink/renderer/core/frame/screen.cc
+index ed5028943e..7b77306185 100644
+--- a/third_party/blink/renderer/core/frame/screen.cc
++++ b/third_party/blink/renderer/core/frame/screen.cc
+@@ -26,6 +26,7 @@
+  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include "third_party/blink/renderer/core/frame/alter_farbling.h"
+ #include "third_party/blink/renderer/core/frame/screen.h"
+ 
+ #include "base/numerics/safe_conversions.h"
+@@ -36,6 +37,7 @@
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/page/chrome_client.h"
++#include "third_party/blink/renderer/core/page/page.h"
+ #include "ui/display/screen_info.h"
+ #include "ui/display/screen_infos.h"
+ 
+@@ -165,16 +167,45 @@ bool Screen::isExtended() const {
+           network::mojom::PermissionsPolicyFeature::kWindowManagement)) {
+     return false;
+   }
++  // Alter: how many monitors you have is yours.
++  if (AlterFarbling::From(context)) {
++    return false;
++  }
+ 
+   return GetScreenInfo().is_extended;
+ }
+ 
++namespace {
++
++// Alter: common screen sizes. A page is told the smallest one its window fits
++// in, so the screen says nothing its window size doesn't already: not the
++// display, not the taskbar or Dock, not where other monitors are.
++gfx::Rect AlterCommonScreen(const gfx::Size& window) {
++  static constexpr int kCommon[][2] = {
++      {1280, 720},  {1366, 768},  {1440, 900},  {1536, 864},
++      {1600, 900},  {1680, 1050}, {1920, 1080}, {1920, 1200},
++      {2560, 1440}, {3440, 1440}, {3840, 2160},
++  };
++  for (const auto& size : kCommon) {
++    if (window.width() <= size[0] && window.height() <= size[1]) {
++      return gfx::Rect(size[0], size[1]);
++    }
++  }
++  return gfx::Rect(window);
++}
++
++}  // namespace
++
+ gfx::Rect Screen::GetRect(bool available) const {
+   if (!DomWindow())
+     return gfx::Rect();
+   LocalFrame* frame = DomWindow()->GetFrame();
+   const display::ScreenInfo& screen_info = GetScreenInfo();
+   gfx::Rect rect = available ? screen_info.available_rect : screen_info.rect;
++  if (frame && frame->GetPage() && AlterFarbling::From(DomWindow())) {
++    rect = AlterCommonScreen(
++        frame->GetPage()->GetChromeClient().RootWindowRect(*frame).size());
++  }
+   if (frame->GetSettings()->GetReportScreenSizeInPhysicalPixelsQuirk())
+     return gfx::ScaleToRoundedRect(rect, screen_info.device_scale_factor);
+   if (frame->GetDocument() && frame->GetDocument()->TextScaleMetaTagPresent()) {
+diff --git a/third_party/blink/renderer/core/frame/local_dom_window.cc b/third_party/blink/renderer/core/frame/local_dom_window.cc
+index f8de9ac..e99be8e 100644
+--- a/third_party/blink/renderer/core/frame/local_dom_window.cc
++++ b/third_party/blink/renderer/core/frame/local_dom_window.cc
+@@ -24,6 +24,7 @@
+  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include "third_party/blink/renderer/core/frame/alter_farbling.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ 
+ #include <memory>
+@@ -1800,6 +1801,10 @@ int LocalDOMWindow::screenX() const {
+     return 0;
+   }
+ 
++  // Alter: the window's place on your screens isn't the page's business.
++  if (AlterFarbling::From(const_cast<LocalDOMWindow*>(this))) {
++    return 0;
++  }
+   ChromeClient& chrome_client = page->GetChromeClient();
+   if (page->GetSettings().GetReportScreenSizeInPhysicalPixelsQuirk()) {
+     return static_cast<int>(
+@@ -1825,6 +1830,9 @@ int LocalDOMWindow::screenY() const {
+     return 0;
+   }
+ 
++  if (AlterFarbling::From(const_cast<LocalDOMWindow*>(this))) {
++    return 0;
++  }
+   ChromeClient& chrome_client = page->GetChromeClient();
+   if (page->GetSettings().GetReportScreenSizeInPhysicalPixelsQuirk()) {
+     return static_cast<int>(

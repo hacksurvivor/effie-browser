@@ -1,0 +1,12 @@
+{
+  "name": "alter-bench",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "fixtures": "node fixtures/server.mjs",
+    "bench": "node run.mjs"
+  },
+  "dependencies": {
+    "js-tiktoken": "1.0.21"
+  }
+}

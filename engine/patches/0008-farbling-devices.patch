@@ -1,0 +1,64 @@
+diff --git a/third_party/blink/renderer/modules/keyboard/keyboard.cc b/third_party/blink/renderer/modules/keyboard/keyboard.cc
+index 909d0dc3b9..ada636fb2d 100644
+--- a/third_party/blink/renderer/modules/keyboard/keyboard.cc
++++ b/third_party/blink/renderer/modules/keyboard/keyboard.cc
+@@ -4,7 +4,9 @@
+ 
+ #include "third_party/blink/renderer/modules/keyboard/keyboard.h"
+ 
++#include "third_party/blink/renderer/core/dom/dom_exception.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/frame/alter_farbling.h"
+ #include "third_party/blink/renderer/modules/keyboard/keyboard_layout.h"
+ #include "third_party/blink/renderer/modules/keyboard/keyboard_lock.h"
+ #include "third_party/blink/renderer/platform/bindings/exception_state.h"
+@@ -31,6 +33,12 @@ void Keyboard::unlock(ScriptState* state) {
+ ScriptPromise<KeyboardLayoutMap> Keyboard::getLayoutMap(
+     ScriptState* state,
+     ExceptionState& exception_state) {
++  // Alter: which keyboard layout you type on is yours (engine/patches/0008).
++  if (AlterFarbling::From(ExecutionContext::From(state))) {
++    exception_state.ThrowDOMException(DOMExceptionCode::kNotAllowedError,
++                                      "The keyboard layout isn't shared.");
++    return EmptyPromise();
++  }
+   return keyboard_layout_->GetKeyboardLayoutMap(state, exception_state);
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/speech/speech_synthesis.cc b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+index 891a81543b..eb5f1ca484 100644
+--- a/third_party/blink/renderer/modules/speech/speech_synthesis.cc
++++ b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+@@ -34,6 +34,7 @@
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_speech_synthesis_error_event_init.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_speech_synthesis_event_init.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
++#include "third_party/blink/renderer/core/frame/alter_farbling.h"
+ #include "third_party/blink/renderer/core/frame/deprecation/deprecation.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+@@ -44,6 +45,7 @@
+ #include "third_party/blink/renderer/modules/speech/speech_synthesis_event.h"
+ #include "third_party/blink/renderer/modules/speech/speech_synthesis_voice.h"
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
++#include "third_party/blink/renderer/platform/language.h"
+ 
+ namespace blink {
+ 
+@@ -85,7 +87,16 @@ SpeechSynthesis::SpeechSynthesis(LocalDOMWindow& window)
+ void SpeechSynthesis::OnSetVoiceList(
+     Vector<mojom::blink::SpeechSynthesisVoicePtr> mojom_voices) {
+   voice_list_.clear();
++  // Alter: the voices for your language and the system's default, not every
++  // voice installed on this machine (engine/patches/0008).
++  const bool alter_trim = AlterFarbling::From(GetExecutionContext());
++  const String language = DefaultLanguage().GetString();
++  const String primary = language.DeprecatedSubstring(0, language.find('-'));
+   for (auto& mojom_voice : mojom_voices) {
++    if (alter_trim && !mojom_voice->is_default &&
++        !mojom_voice->lang.StartsWithIgnoringAsciiCase(primary)) {
++      continue;
++    }
+     voice_list_.push_back(
+         MakeGarbageCollected<SpeechSynthesisVoice>(std::move(mojom_voice)));
+   }

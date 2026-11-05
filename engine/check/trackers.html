@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tracker check</title>
+<!--
+  Loads well-known trackers and a file of the page's own; window.trackers says which loaded.
+  With Effie's blocking (spikes/shell/src/shared/trackers.rs) the trackers fail and the page's
+  own file loads. Needs the network for the trackers.
+-->
+<pre id="out">working…</pre>
+<script>
+function load(tag, src) {
+  return new Promise((done) => {
+    const el = document.createElement(tag);
+    el.onload = () => done("loaded");
+    el.onerror = () => done("blocked or failed");
+    el.src = src;
+    document.body.append(el);
+    setTimeout(() => done("timed out"), 8000);
+  });
+}
+(async () => {
+  const result = {
+    googleAnalytics: await load("script", "https://www.google-analytics.com/analytics.js"),
+    googleTagManager: await load("script", "https://www.googletagmanager.com/gtag/js?id=G-TEST"),
+    doubleclick: await load("img", "https://googleads.g.doubleclick.net/pagead/id"),
+    facebookPixel: await load("script", "https://connect.facebook.net/en_US/fbevents.js"),
+    ownFile: await load("script", "farbling-own.js"),
+  };
+  window.trackers = result;
+  document.getElementById("out").textContent = JSON.stringify(result, null, 2);
+})();
+</script>

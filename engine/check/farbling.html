@@ -1,0 +1,113 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Farbling check</title>
+<!--
+  Fingerprint values the engine's farbling patches change (canvas, audio, WebGL, navigator).
+  Open it from two sites (for example http://127.0.0.1:8765/farbling.html and
+  http://localhost:8765/farbling.html) and across two launches: the noisy values (canvas, audio,
+  readPixels) should match within a site and launch and differ between sites and launches; the
+  GPU name and core count should be the common ones. Drawings must still look the same.
+  window.farbling holds the result as JSON.
+-->
+<pre id="out">working…</pre>
+<script>
+async function sha(data) {
+  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+  const d = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(d)].slice(0, 8).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function draw() {
+  const c = document.createElement("canvas");
+  c.width = 240; c.height = 60;
+  const g = c.getContext("2d");
+  g.fillStyle = "#f60"; g.fillRect(10, 5, 100, 40);
+  g.fillStyle = "#069"; g.font = "18px Arial"; g.fillText("Alter farbling ✓", 4, 30);
+  g.fillStyle = "rgba(102,204,0,0.7)"; g.fillText("Alter farbling ✓", 8, 40);
+  return c;
+}
+
+async function canvasValues() {
+  const c = draw();
+  const url = c.toDataURL();
+  const pixels = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+  const blob = await new Promise(r => c.toBlob(r));
+  return {
+    dataURL: await sha(url),
+    imageData: await sha(pixels),
+    blob: await sha(new Uint8Array(await blob.arrayBuffer())),
+    repeatSame: c.toDataURL() === url,
+  };
+}
+
+async function audioValue() {
+  const ctx = new OfflineAudioContext(1, 5000, 44100);
+  const osc = ctx.createOscillator();
+  osc.type = "triangle"; osc.frequency.value = 10000;
+  const comp = ctx.createDynamicsCompressor();
+  osc.connect(comp); comp.connect(ctx.destination); osc.start(0);
+  const buffer = await ctx.startRendering();
+  const data = buffer.getChannelData(0);
+  let sum = 0;
+  for (let i = 4500; i < 5000; i++) sum += Math.abs(data[i]);
+  return { sum: sum.toPrecision(15) };
+}
+
+async function webglValues() {
+  const c = document.createElement("canvas");
+  c.width = 64; c.height = 64;
+  const gl = c.getContext("webgl", { preserveDrawingBuffer: true });
+  if (!gl) return { available: false };
+  const info = gl.getExtension("WEBGL_debug_renderer_info");
+  gl.clearColor(0.2, 0.4, 0.6, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  const pixels = new Uint8Array(64 * 64 * 4);
+  gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  return {
+    vendor: info ? gl.getParameter(info.UNMASKED_VENDOR_WEBGL) : null,
+    renderer: info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : null,
+    readPixels: await sha(pixels),
+  };
+}
+
+async function devicesSeen() {
+  const voices = await new Promise((done) => {
+    const now = speechSynthesis.getVoices();
+    if (now.length) return done(now);
+    speechSynthesis.onvoiceschanged = () => done(speechSynthesis.getVoices());
+    setTimeout(() => done(speechSynthesis.getVoices()), 3000);
+  });
+  let layout;
+  try { layout = (await navigator.keyboard.getLayoutMap()).size; } catch (e) { layout = e.name; }
+  const media = await navigator.mediaDevices.enumerateDevices().then((d) => d.map((x) => x.kind + (x.label ? ":" + x.label : ""))).catch((e) => e.name);
+  return { voices: voices.length, voiceLanguages: [...new Set(voices.map((v) => v.lang))].slice(0, 12), keyboardLayout: layout, media };
+}
+
+// Whether a page can see an installed font: text measured in it differs from the fallback.
+function fontsSeen(names) {
+  const g = document.createElement("canvas").getContext("2d");
+  const probe = "mmmmmmmmmmlli1WWQ@#";
+  const width = (font) => { g.font = font; return g.measureText(probe).width; };
+  const out = {};
+  for (const base of ["monospace", "serif"]) {
+    for (const name of names) {
+      out[name] = out[name] || width(`72px "${name}", ${base}`) !== width(`72px ${base}`);
+    }
+  }
+  return out;
+}
+
+(async () => {
+  const result = {
+    site: location.origin, canvas: await canvasValues(), audio: await audioValue(), webgl: await webglValues(),
+    navigator: { hardwareConcurrency: navigator.hardwareConcurrency, deviceMemory: navigator.deviceMemory, languages: navigator.languages },
+    screen: { width: screen.width, height: screen.height, availWidth: screen.availWidth, availHeight: screen.availHeight,
+      availLeft: screen.availLeft, availTop: screen.availTop, screenX, screenY, outerWidth, outerHeight, innerWidth, innerHeight,
+      isExtended: screen.isExtended },
+    devices: await devicesSeen(),
+    fonts: fontsSeen(["DejaVu Sans", "Liberation Serif", "Lato", "FontAwesome", "Arial", "Helvetica Neue", "Segoe UI"]),
+  };
+  window.farbling = result;
+  document.getElementById("out").textContent = JSON.stringify(result, null, 2);
+  document.body.append(draw());
+})();
+</script>

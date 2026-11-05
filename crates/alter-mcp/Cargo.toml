@@ -1,0 +1,13 @@
+[package]
+name = "alter-mcp"
+description = "The MCP server that connects AI agents to Effie Browser."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1.1"

@@ -1,0 +1,115 @@
+diff --git a/third_party/blink/renderer/modules/webaudio/analyser_node.cc b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
+index 4bc4b15f4b..aa854e046f 100644
+--- a/third_party/blink/renderer/modules/webaudio/analyser_node.cc
++++ b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
+@@ -25,7 +25,10 @@
+ 
+ #include "third_party/blink/renderer/modules/webaudio/analyser_node.h"
+ 
++#include <cmath>
++
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_analyser_options.h"
++#include "third_party/blink/renderer/core/frame/alter_farbling.h"
+ #include "third_party/blink/renderer/modules/webaudio/analyser_handler.h"
+ #include "third_party/blink/renderer/modules/webaudio/audio_graph_tracer.h"
+ #include "third_party/blink/renderer/modules/webaudio/base_audio_context.h"
+@@ -126,6 +129,13 @@ double AnalyserNode::smoothingTimeConstant() const {
+ void AnalyserNode::getFloatFrequencyData(NotShared<DOMFloat32Array> array) {
+   GetAnalyserHandler().GetFloatFrequencyData(array.Get(),
+                                              context()->currentTime());
++  // Alter: the same per-site factor as sample reads, in decibels.
++  if (AlterFarbling* farbling = AlterFarbling::From(GetExecutionContext())) {
++    const float offset = 20 * std::log10(farbling->AudioFactor());
++    for (float& db : array->AsSpan()) {
++      db += offset;
++    }
++  }
+ }
+ 
+ void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
+@@ -135,6 +145,9 @@ void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
+ 
+ void AnalyserNode::getFloatTimeDomainData(NotShared<DOMFloat32Array> array) {
+   GetAnalyserHandler().GetFloatTimeDomainData(array.Get());
++  if (AlterFarbling* farbling = AlterFarbling::From(GetExecutionContext())) {
++    farbling->FarbleAudio(array->AsSpan());
++  }
+ }
+ 
+ void AnalyserNode::getByteTimeDomainData(NotShared<DOMUint8Array> array) {
+diff --git a/third_party/blink/renderer/modules/webaudio/audio_buffer.cc b/third_party/blink/renderer/modules/webaudio/audio_buffer.cc
+index 7a899b0d8c..714c977762 100644
+--- a/third_party/blink/renderer/modules/webaudio/audio_buffer.cc
++++ b/third_party/blink/renderer/modules/webaudio/audio_buffer.cc
+@@ -33,7 +33,9 @@
+ #include "base/check_op.h"
+ #include "base/compiler_specific.h"
+ #include "base/containers/span.h"
++#include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_audio_buffer_options.h"
++#include "third_party/blink/renderer/core/frame/alter_farbling.h"
+ #include "third_party/blink/renderer/modules/webaudio/base_audio_context.h"
+ #include "third_party/blink/renderer/platform/audio/audio_bus.h"
+ #include "third_party/blink/renderer/platform/audio/audio_utilities.h"
+@@ -214,9 +216,27 @@ NotShared<DOMFloat32Array> AudioBuffer::getChannelData(
+     return NotShared<DOMFloat32Array>(nullptr);
+   }
+ 
++  AlterFarble(exception_state.GetIsolate());
+   return getChannelData(channel_index);
+ }
+ 
++void AudioBuffer::AlterFarble(v8::Isolate* isolate) {
++  if (alter_farbled_) {
++    return;
++  }
++  alter_farbled_ = true;
++  AlterFarbling* farbling =
++      AlterFarbling::From(isolate ? CurrentExecutionContext(isolate) : nullptr);
++  if (!farbling) {
++    return;
++  }
++  for (auto& channel : channels_) {
++    if (channel) {
++      farbling->FarbleAudio(channel->AsSpan());
++    }
++  }
++}
++
+ NotShared<DOMFloat32Array> AudioBuffer::getChannelData(unsigned channel_index) {
+   if (channel_index >= channels_.size()) {
+     return NotShared<DOMFloat32Array>(nullptr);
+@@ -252,6 +272,7 @@ void AudioBuffer::copyFromChannel(NotShared<DOMFloat32Array> destination,
+     return;
+   }
+ 
++  AlterFarble(exception_state.GetIsolate());
+   base::span<const float> src = channels_[channel_number].Get()->AsSpan();
+   base::span<float> dst = destination->AsSpan();
+ 
+diff --git a/third_party/blink/renderer/modules/webaudio/audio_buffer.h b/third_party/blink/renderer/modules/webaudio/audio_buffer.h
+index 0dd11f830e..8da697414a 100644
+--- a/third_party/blink/renderer/modules/webaudio/audio_buffer.h
++++ b/third_party/blink/renderer/modules/webaudio/audio_buffer.h
+@@ -38,6 +38,10 @@
+ #include "third_party/blink/renderer/platform/wtf/allocator/allocator.h"
+ #include "third_party/blink/renderer/platform/wtf/vector.h"
+ 
++namespace v8 {
++class Isolate;
++}  // namespace v8
++
+ namespace blink {
+ 
+ class AudioBus;
+@@ -123,6 +127,10 @@ class MODULES_EXPORT AudioBuffer final : public ScriptWrappable {
+   uint32_t length_;
+ 
+   HeapVector<Member<DOMFloat32Array>> channels_;
++
++  // Alter: farbles every channel in place the first time a page reads one.
++  void AlterFarble(v8::Isolate* isolate);
++  bool alter_farbled_ = false;
+ };
+ 
+ // Shared data that audio threads can hold onto.

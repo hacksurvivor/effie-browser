@@ -1,0 +1,205 @@
+From fc5529f522a28df6ff5d5f7e572debc71d6f18e4 Mon Sep 17 00:00:00 2001
+From: Xiyuan Xia <xiyuan@google.com>
+Date: Tue, 6 Oct 2026 12:25:34 -0700
+Subject: [PATCH] [mac] Keep same clipboard sequence token for same changeCount
+
+ClipboardMac::ClipboardChanged() is delivered via a posted task, so
+there is always a window between the pasteboard reaching changeCount N
+and ClipboardChanged() processing N. If a paste starts in that window,
+Blink's GetSequenceNumber() mints token T1 for N; ClipboardChanged()
+then runs and mints a second token T2 for the same N. Blink's
+post-paste-event check sees T1 != T2, assumes the clipboard changed
+mid-paste, and silently drops the insertion (beforeinput data=null).
+
+This affects pastes of data copied outside of Chrome. It is hit reliably
+by apps that write to NSPasteboard and immediately synthesize Cmd-V, but
+a user who copies elsewhere and quickly pastes into Chrome, or pastes
+while the browser main thread is busy, can hit it too.
+
+Fix by only minting a new token in ClipboardChanged() if
+GetSequenceNumber() has not already done so for the current changeCount.
+Observer notification is unchanged.
+
+Adds a regression test that exercises the real async notification path
+and fails without this change.
+
+Bug: 568453825
+Change-Id: Ifa4ac6ce69c8c5b7422f0cbc5b525ff706180008
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/8503629
+Reviewed-by: Avi Drissman <avi@chromium.org>
+Commit-Queue: Xiyuan Xia <xiyuan@chromium.org>
+Cr-Commit-Position: refs/heads/main@{#1712562}
+---
+ ui/base/clipboard/clipboard_mac.h           |  6 ++-
+ ui/base/clipboard/clipboard_mac.mm          | 39 ++++++++++----
+ ui/base/clipboard/clipboard_mac_unittest.mm | 59 +++++++++++++++++++++
+ 3 files changed, 92 insertions(+), 12 deletions(-)
+
+diff --git a/ui/base/clipboard/clipboard_mac.h b/ui/base/clipboard/clipboard_mac.h
+index a7c1bd7c262e2a..a9cd37da4fd372 100644
+--- a/ui/base/clipboard/clipboard_mac.h
++++ b/ui/base/clipboard/clipboard_mac.h
+@@ -48,6 +48,8 @@ class COMPONENT_EXPORT(UI_BASE_CLIPBOARD) ClipboardMac
+                  GetSourceCallback callback) const override;
+   const ClipboardSequenceNumberToken& GetSequenceNumber(
+       ClipboardBuffer buffer) const override;
++  const ClipboardSequenceNumberToken& GetSequenceNumber(
++      NSPasteboard* pasteboard) const;
+   void GetStandardFormats(ClipboardBuffer buffer,
+                           const std::optional<DataTransferEndpoint>& data_dst,
+                           GetStandardFormatsCallback callback) const override;
+@@ -127,7 +129,9 @@ class COMPONENT_EXPORT(UI_BASE_CLIPBOARD) ClipboardMac
+       std::unique_ptr<DataTransferEndpoint> data_src,
+       NSPasteboard* pasteboard,
+       uint32_t privacy_types);
+-  void ClipboardChanged();
++  // Invoked when the pasteboard changes.
++  void OnPasteboardChanged();
++  void ClipboardChanged(NSPasteboard* pasteboard);
+ 
+   // Mapping of OS-provided sequence number to a unique token.
+   mutable struct {
+diff --git a/ui/base/clipboard/clipboard_mac.mm b/ui/base/clipboard/clipboard_mac.mm
+index 5edb382ce4ea54..b121125220fbe1 100644
+--- a/ui/base/clipboard/clipboard_mac.mm
++++ b/ui/base/clipboard/clipboard_mac.mm
+@@ -140,7 +140,7 @@ - (BOOL)_setExpirationDate:(NSDate*)date;
+     // lifetime of this object.
+     clipboard_change_subscription_ =
+         base::RegisterPasteboardChangedCallback(base::BindRepeating(
+-            &ClipboardMac::ClipboardChanged, base::Unretained(this)));
++            &ClipboardMac::OnPasteboardChanged, base::Unretained(this)));
+   }
+ }
+ 
+@@ -181,10 +181,14 @@ - (BOOL)_setExpirationDate:(NSDate*)date;
+ 
+ const ClipboardSequenceNumberToken& ClipboardMac::GetSequenceNumber(
+     ClipboardBuffer buffer) const {
+-  DCHECK(CalledOnValidThread());
+   DCHECK_EQ(buffer, ClipboardBuffer::kCopyPaste);
++  return GetSequenceNumber(GetPasteboard());
++}
+ 
+-  NSInteger sequence_number = [GetPasteboard() changeCount];
++const ClipboardSequenceNumberToken& ClipboardMac::GetSequenceNumber(
++    NSPasteboard* pasteboard) const {
++  DCHECK(CalledOnValidThread());
++  NSInteger sequence_number = pasteboard.changeCount;
+   if (sequence_number != clipboard_sequence_.sequence_number) {
+     // Generate a unique token associated with the current sequence number.
+     clipboard_sequence_ = {sequence_number, ClipboardSequenceNumberToken()};
+@@ -685,17 +689,30 @@ - (BOOL)_setExpirationDate:(NSDate*)date;
+   [pasteboard writeObjects:@[ image ]];
+ }
+ 
+-void ClipboardMac::ClipboardChanged() {
+-  NSInteger current_sequence_number = GetPasteboard().changeCount;
+-  if (current_sequence_number != last_known_sequence_number_) {
+-    last_known_sequence_number_ = current_sequence_number;
+-    // Update clipboard_sequence_ to reflect the new number and generate a new
+-    // token, so subsequent calls to GetSequenceNumber() return the latest
+-    // state.
++void ClipboardMac::OnPasteboardChanged() {
++  ClipboardChanged(GetPasteboard());
++}
++
++void ClipboardMac::ClipboardChanged(NSPasteboard* pasteboard) {
++  DCHECK(CalledOnValidThread());
++  NSInteger current_sequence_number = pasteboard.changeCount;
++  if (current_sequence_number == last_known_sequence_number_) {
++    return;
++  }
++  last_known_sequence_number_ = current_sequence_number;
++  // Make sure `clipboard_sequence_` reflects the new changeCount so subsequent
++  // calls to GetSequenceNumber() return the latest state. Only mint a new token
++  // if GetSequenceNumber() has not already done so for this changeCount: this
++  // notification is delivered asynchronously and may arrive after a consumer
++  // (e.g. Blink at the start of a paste) already observed a token for it.
++  // Minting a second token for an unchanged pasteboard would make that
++  // in-flight paste look like the clipboard changed underneath it, and Blink
++  // would drop the paste. See crbug.com/568453825.
++  if (current_sequence_number != clipboard_sequence_.sequence_number) {
+     clipboard_sequence_ = {current_sequence_number,
+                            ClipboardSequenceNumberToken()};
+-    ClipboardMonitor::GetInstance()->NotifyClipboardDataChanged();
+   }
++  ClipboardMonitor::GetInstance()->NotifyClipboardDataChanged();
+ }
+ 
+ }  // namespace ui
+diff --git a/ui/base/clipboard/clipboard_mac_unittest.mm b/ui/base/clipboard/clipboard_mac_unittest.mm
+index 854f74f962d78a..271506be175a3f 100644
+--- a/ui/base/clipboard/clipboard_mac_unittest.mm
++++ b/ui/base/clipboard/clipboard_mac_unittest.mm
+@@ -124,6 +124,16 @@ void WritePortableAndPlatformRepresentations(
+         /*privacy_types=*/0);
+   }
+ 
++  ClipboardSequenceNumberToken GetSequenceNumber(
++      const ClipboardMac* clipboard_mac,
++      NSPasteboard* pasteboard) {
++    return clipboard_mac->GetSequenceNumber(pasteboard);
++  }
++
++  void ClipboardChanged(ClipboardMac* clipboard_mac, NSPasteboard* pasteboard) {
++    clipboard_mac->ClipboardChanged(pasteboard);
++  }
++
+   // Helper method to run assertion with given count value
+   void AssertClipboardObserverCount(TestClipboardObserver& observer,
+                                     int expected_count) {
+@@ -303,4 +313,53 @@ void AssertClipboardObserverCount(TestClipboardObserver& observer,
+   Clear(clipboard_mac, nspasteboard);
+ }
+ 
++// Regression test for crbug.com/568453825: an external app writes to the
++// pasteboard and immediately triggers a paste. Blink reads the sequence number
++// at the start of the paste (minting a token for the new changeCount) before
++// the asynchronous pasteboard-changed notification has been delivered. When
++// that notification arrives for the same changeCount, it must not mint a
++// second token, or Blink will conclude the clipboard changed mid-paste and
++// drop the paste.
++//
++// A private pasteboard is used, and the change notification is delivered
++// directly, so that test processes running in parallel on the same machine
++// (which share the general pasteboard) cannot perturb the changeCount.
++TEST_F(ClipboardMacTest, SequenceNumberStableAcrossChangeNotification) {
++  TestClipboardObserver observer;
++  scoped_refptr<UniquePasteboard> pasteboard = new UniquePasteboard;
++
++  Clipboard* clipboard = Clipboard::GetForCurrentThread();
++  ClipboardMac* clipboard_mac = static_cast<ClipboardMac*>(clipboard);
++
++  // Simulate an external application writing to the pasteboard.
++  [pasteboard->get() clearContents];
++  [pasteboard->get() setString:@"Hello from external app"
++                       forType:NSPasteboardTypeString];
++
++  // Simulate Blink reading the sequence number at the start of a paste, before
++  // the change notification has been processed.
++  const ClipboardSequenceNumberToken token_before =
++      GetSequenceNumber(clipboard_mac, pasteboard->get());
++
++  // Deliver the change notification for the same changeCount. Observers must
++  // be told, but the token must not change.
++  const int count_before = observer.data_changed_count();
++  ClipboardChanged(clipboard_mac, pasteboard->get());
++  EXPECT_EQ(observer.data_changed_count(), count_before + 1);
++  EXPECT_EQ(token_before, GetSequenceNumber(clipboard_mac, pasteboard->get()));
++
++  // Re-delivering a notification for an unchanged changeCount is a no-op.
++  ClipboardChanged(clipboard_mac, pasteboard->get());
++  EXPECT_EQ(observer.data_changed_count(), count_before + 1);
++  EXPECT_EQ(token_before, GetSequenceNumber(clipboard_mac, pasteboard->get()));
++
++  // A real change must still produce a new token and a notification.
++  [pasteboard->get() clearContents];
++  [pasteboard->get() setString:@"Something else"
++                       forType:NSPasteboardTypeString];
++  ClipboardChanged(clipboard_mac, pasteboard->get());
++  EXPECT_EQ(observer.data_changed_count(), count_before + 2);
++  EXPECT_NE(token_before, GetSequenceNumber(clipboard_mac, pasteboard->get()));
++}
++
+ }  // namespace ui

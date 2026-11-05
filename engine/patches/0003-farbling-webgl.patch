@@ -1,0 +1,57 @@
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index b17f336f90..925560c3f3 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -75,6 +75,7 @@
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_webgl_copy_element_image_config.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/webgl_any.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/frame/alter_farbling.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/local_frame_client.h"
+@@ -4216,6 +4217,10 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++        // Alter: a common GPU, not this machine's.
++        if (AlterFarbling::From(ExecutionContext::From(script_state))) {
++          return WebGLAny(script_state, String(AlterFarbling::GpuRenderer()));
++        }
+         return WebGLAny(script_state,
+                         String(ContextGL()->GetString(GL_RENDERER)));
+       }
+@@ -4225,6 +4230,9 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++        if (AlterFarbling::From(ExecutionContext::From(script_state))) {
++          return WebGLAny(script_state, String(AlterFarbling::GpuVendor()));
++        }
+         return WebGLAny(script_state,
+                         String(ContextGL()->GetString(GL_VENDOR)));
+       }
+@@ -5372,6 +5380,23 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
+     }
+     ContextGL()->ReadPixels(x, y, width, height, format, type, data);
+   }
++
++  // Alter: the same per-site noise as canvas reads, on RGBA8 reads (what
++  // fingerprinting scripts use). The size was checked above against the
++  // buffer, with packing, so width * height * 4 bytes are the page's own.
++  if (format == GL_RGBA && type == GL_UNSIGNED_BYTE && width > 0 &&
++      height > 0 && !buffer) {
++    if (AlterFarbling* farbling = AlterFarbling::From(
++            Host() ? Host()->GetTopExecutionContext() : nullptr)) {
++      base::CheckedNumeric<size_t> bytes = width;
++      bytes *= height;
++      bytes *= 4;
++      if (bytes.IsValid() && bytes.ValueOrDie() <= buffer_size.ValueOrDie()) {
++        farbling->PerturbPixels(
++            UNSAFE_BUFFERS(base::span<uint8_t>(data, bytes.ValueOrDie())));
++      }
++    }
++  }
+ }
+ 
+ void WebGLRenderingContextBase::RenderbufferStorageImpl(

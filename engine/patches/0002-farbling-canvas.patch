@@ -1,0 +1,190 @@
+diff --git a/third_party/blink/renderer/core/html/canvas/DEPS b/third_party/blink/renderer/core/html/canvas/DEPS
+index 03ddeed125..cc35db21ad 100644
+--- a/third_party/blink/renderer/core/html/canvas/DEPS
++++ b/third_party/blink/renderer/core/html/canvas/DEPS
+@@ -9,4 +9,5 @@ include_rules = [
+ "+cc/layers/texture_layer_client.h",
+ "+components/viz/common/resources/shared_image_format.h",
+ "+components/viz/common/resources/shared_image_format_utils.h",
++"+ui/gfx/skia_span_util.h",
+ ]
+diff --git a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
+index 8e9d842904..bdc8a79ed6 100644
+--- a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
++++ b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
+@@ -15,6 +15,7 @@
+ #include "third_party/blink/renderer/core/dom/dom_exception.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/fileapi/blob.h"
++#include "third_party/blink/renderer/core/frame/alter_farbling.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h"
+ #include "third_party/blink/renderer/platform/graphics/image_data_buffer.h"
+ #include "third_party/blink/renderer/platform/graphics/skia/skia_utils.h"
+@@ -33,9 +34,11 @@
+ #include "third_party/blink/renderer/platform/wtf/text/base64.h"
+ #include "third_party/blink/renderer/platform/wtf/text/strcat.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
++#include "third_party/skia/include/core/SkData.h"
+ #include "third_party/skia/include/core/SkImage.h"
+ #include "third_party/skia/include/core/SkSurface.h"
+ #include "third_party/skia/include/encode/SkPngRustEncoder.h"
++#include "ui/gfx/skia_span_util.h"
+ 
+ namespace blink {
+ 
+@@ -224,6 +227,23 @@ CanvasAsyncBlobCreator::CanvasAsyncBlobCreator(
+                            std::min(info.height(), max_dimension));
+         src_data_.reset(info, src_data_.addr(), src_data_.rowBytes());
+       }
++
++      // Alter: farble a private copy of the pixels, never the canvas's own.
++      if (AlterFarbling* farbling = AlterFarbling::From(context);
++          farbling && src_data_.info().bytesPerPixel() == 4) {
++        const SkImageInfo info = src_data_.info();
++        const size_t row_bytes = info.minRowBytes();
++        const size_t size = info.computeByteSize(row_bytes);
++        if (!SkImageInfo::ByteSizeOverflowed(size)) {
++          sk_sp<SkData> copy = SkData::MakeUninitialized(size);
++          if (src_data_.readPixels(info, copy->writable_data(), row_bytes)) {
++            src_data_.reset(info, copy->writable_data(), row_bytes);
++            farbling->PerturbPixels(gfx::SkPixmapToWritableSpan(src_data_));
++            skia_image_ =
++                SkImages::RasterFromData(info, std::move(copy), row_bytes);
++          }
++        }
++      }
+     }
+   }
+ 
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index 2a5404e4cf..bd512c8cf5 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -71,6 +71,7 @@
+ #include "third_party/blink/renderer/core/event_type_names.h"
+ #include "third_party/blink/renderer/core/fileapi/file.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/core/frame/alter_farbling.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/local_frame_client.h"
+ #include "third_party/blink/renderer/core/frame/local_frame_view.h"
+@@ -1464,6 +1465,12 @@ String HTMLCanvasElement::ToDataURLInternal(
+     if (!data_buffer)
+       return String("data:,");
+ 
++    if (AlterFarbling* farbling = AlterFarbling::From(GetExecutionContext())) {
++      data_buffer->MutatePixels([farbling](base::span<uint8_t> pixels) {
++        farbling->PerturbPixels(pixels);
++      });
++    }
++
+     String data_url = data_buffer->ToDataURL(encoding_mime_type, quality);
+     base::TimeDelta elapsed_time = base::TimeTicks::Now() - start_time;
+     float sqrt_pixels =
+diff --git a/third_party/blink/renderer/modules/canvas/DEPS b/third_party/blink/renderer/modules/canvas/DEPS
+index 1b6195c0b0..de2397497f 100644
+--- a/third_party/blink/renderer/modules/canvas/DEPS
++++ b/third_party/blink/renderer/modules/canvas/DEPS
+@@ -1,4 +1,5 @@
+ include_rules = [
++  "+ui/gfx/skia_span_util.h",
+   "+cc/base/features.h",
+ ]
+ 
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index e014baae31..a2b61213a6 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -42,6 +42,7 @@
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_canvas_font_variant_caps.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_canvas_text_rendering.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_draw_element_image_options.h"
++#include "third_party/blink/renderer/core/frame/alter_farbling.h"
+ #include "third_party/blink/renderer/core/css/properties/computed_style_utils.h"
+ #include "third_party/blink/renderer/core/css/style_change_reason.h"
+ #include "third_party/blink/renderer/core/dom/dom_node_ids.h"
+@@ -110,6 +111,7 @@
+ #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
+ #include "ui/gfx/geometry/skia_conversions.h"
+ #include "ui/gfx/geometry/vector2d_f.h"
++#include "ui/gfx/skia_span_util.h"
+ 
+ // Including "base/time/time.h" triggers a bug in IWYU.
+ // https://github.com/include-what-you-use/include-what-you-use/issues/1122
+@@ -560,6 +562,13 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+       SkIRect bounds =
+           snapshot->PaintImageForCurrentFrame().GetSkImageInfo().bounds();
+       DCHECK(!bounds.intersect(SkIRect::MakeXYWH(sx, sy, sw, sh)));
++    } else if (image_data_pixmap.info().bytesPerPixel() == 4) {
++      // Alter: the page's own copy of the pixels, farbled per site.
++      if (AlterFarbling* farbling =
++              AlterFarbling::From(GetTopExecutionContext())) {
++        farbling->PerturbPixels(
++            gfx::SkPixmapToWritableSpan(image_data_pixmap));
++      }
+     }
+   }
+ 
+diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+index d05ea261a9..fad7a802a5 100644
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+@@ -136,6 +136,26 @@ base::span<const uint8_t> ImageDataBuffer::PixelData() const {
+   return gfx::SkPixmapToSpan(pixmap_);
+ }
+ 
++void ImageDataBuffer::MutatePixels(
++    base::FunctionRef<void(base::span<uint8_t>)> mutate) {
++  if (!is_valid_ || pixmap_.info().bytesPerPixel() != 4) {
++    return;
++  }
++  const SkImageInfo info = pixmap_.info();
++  const size_t row_bytes = info.minRowBytes();
++  const size_t size = info.computeByteSize(row_bytes);
++  if (SkImageInfo::ByteSizeOverflowed(size)) {
++    return;
++  }
++  sk_sp<SkData> copy = SkData::MakeUninitialized(size);
++  if (!pixmap_.readPixels(info, copy->writable_data(), row_bytes)) {
++    return;
++  }
++  alter_pixels_ = std::move(copy);
++  pixmap_ = {info, alter_pixels_->writable_data(), row_bytes};
++  mutate(gfx::SkPixmapToWritableSpan(pixmap_));
++}
++
+ bool ImageDataBuffer::EncodeImage(const ImageEncodingMimeType mime_type,
+                                   const double& quality,
+                                   Vector<unsigned char>* encoded_image) const {
+diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.h b/third_party/blink/renderer/platform/graphics/image_data_buffer.h
+index 7788473df7..630d691075 100644
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.h
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.h
+@@ -31,6 +31,7 @@
+ #include <memory>
+ 
+ #include "base/containers/span.h"
++#include "base/functional/function_ref.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/image-encoders/image_encoder.h"
+@@ -59,6 +60,11 @@ class PLATFORM_EXPORT ImageDataBuffer {
+ 
+   base::span<const uint8_t> PixelData() const;
+ 
++  // Alter: lets a fingerprinting defence change the 8-bit RGBA/BGRA pixels
++  // about to be encoded. The buffer takes a private copy first, so the image
++  // it was made from is never touched. Other pixel formats are left alone.
++  void MutatePixels(base::FunctionRef<void(base::span<uint8_t>)> mutate);
++
+  private:
+   ImageDataBuffer(const SkPixmap&);
+   ImageDataBuffer(scoped_refptr<StaticBitmapImage>);
+@@ -66,6 +72,7 @@ class PLATFORM_EXPORT ImageDataBuffer {
+   bool IsValid() { return is_valid_; }  // Only used by Create()
+ 
+   sk_sp<SkImage> retained_image_;
++  sk_sp<SkData> alter_pixels_;
+   SkPixmap pixmap_;
+   bool is_valid_ = false;
+ };

@@ -1,0 +1,399 @@
+diff --git a/third_party/blink/renderer/core/BUILD.gn b/third_party/blink/renderer/core/BUILD.gn
+index 056bd22809..252c51be19 100644
+--- a/third_party/blink/renderer/core/BUILD.gn
++++ b/third_party/blink/renderer/core/BUILD.gn
+@@ -413,6 +413,7 @@ component("core") {
+     "//components/shared_highlighting/core/common",
+     "//components/subresource_filter/core/common",
+     "//components/web_package",
++    "//crypto",  # Alter: alter_farbling.cc
+     "//gin",
+     "//gpu/config",
+     "//mojo/public/cpp/bindings",
+diff --git a/third_party/blink/renderer/core/frame/DEPS b/third_party/blink/renderer/core/frame/DEPS
+index e356f9be08..b1f4e3510f 100644
+--- a/third_party/blink/renderer/core/frame/DEPS
++++ b/third_party/blink/renderer/core/frame/DEPS
+@@ -4,6 +4,10 @@ include_rules = {
+ }
+ 
+ specific_include_rules = {
++  "alter_farbling\\.cc": [
++    "+base/command_line.h",
++    "+crypto/hmac.h",
++  ],
+   "ad_tracker_test\\.cc": [
+     "+base/run_loop.h",
+   ],
+diff --git a/third_party/blink/renderer/core/frame/alter_farbling.cc b/third_party/blink/renderer/core/frame/alter_farbling.cc
+new file mode 100644
+index 0000000000..89a1691cc0
+--- /dev/null
++++ b/third_party/blink/renderer/core/frame/alter_farbling.cc
+@@ -0,0 +1,244 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * Alter's fingerprinting defences ("farbling"), after Brave's
++ * brave_session_cache (Copyright (c) 2020 The Brave Authors). */
++
++#include "third_party/blink/renderer/core/frame/alter_farbling.h"
++
++#include <algorithm>
++#include <cstring>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/containers/span.h"
++#include "base/no_destructor.h"
++#include "base/numerics/byte_conversions.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "build/build_config.h"
++#include "crypto/hmac.h"
++#include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/workers/worker_global_scope.h"
++#include "third_party/blink/renderer/core/workers/worklet_global_scope.h"
++#include "third_party/blink/renderer/platform/network/blink_schemeful_site.h"
++#include "third_party/blink/renderer/platform/weborigin/security_origin.h"
++
++namespace blink {
++
++namespace {
++
++// Set by Alter's shell on every renderer it launches.
++constexpr char kKeySwitch[] = "alter-farbling-key";      // 64 hex digits
++constexpr char kLevelSwitch[] = "alter-farbling";         // off|standard|strict
++constexpr char kOffSwitch[] = "alter-farbling-off";       // sites, comma-separated
++
++struct SessionConfig {
++  std::optional<std::array<uint8_t, 32>> key;
++  AlterFarblingLevel level = AlterFarblingLevel::kOff;
++  // Registrable domains you turned protection off on (Effie's site card).
++  std::vector<std::string> off_sites;
++};
++
++const SessionConfig& Config() {
++  static const base::NoDestructor<SessionConfig> config([] {
++    SessionConfig c;
++    const base::CommandLine& cl = *base::CommandLine::ForCurrentProcess();
++    std::array<uint8_t, 32> key;
++    if (!base::HexStringToSpan(cl.GetSwitchValueASCII(kKeySwitch), key)) {
++      return c;
++    }
++    std::string level = cl.GetSwitchValueASCII(kLevelSwitch);
++    if (level == "off") {
++      return c;
++    }
++    c.key = key;
++    c.level = level == "strict" ? AlterFarblingLevel::kStrict
++                                : AlterFarblingLevel::kStandard;
++    c.off_sites = base::SplitString(cl.GetSwitchValueASCII(kOffSwitch), ",",
++                                    base::TRIM_WHITESPACE,
++                                    base::SPLIT_WANT_NONEMPTY);
++    return c;
++  }());
++  return *config;
++}
++
++// Our own and local pages are left alone.
++bool IsExempt(const SecurityOrigin* origin) {
++  if (!origin) {
++    return true;
++  }
++  const String protocol =
++      origin->GetOriginOrPrecursorOriginIfOpaque()->Protocol();
++  static constexpr const char* kExempt[] = {
++      "file",   "chrome-extension", "chrome", "chrome-untrusted",
++      "devtools", "chrome-search",  "alter",  "",
++  };
++  for (const char* scheme : kExempt) {
++    if (protocol == scheme) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// The site whose session values a context shares: the top-level site for
++// frames and dedicated workers, the context's own site otherwise. An
++// anonymous iframe's or a fenced frame's nonce keeps it apart.
++std::string SiteFor(ExecutionContext& context) {
++  if (auto* window = DynamicTo<LocalDOMWindow>(&context)) {
++    const BlinkStorageKey& key = window->GetStorageKey();
++    std::string site = key.GetTopLevelSite().Serialize().Utf8();
++    if (const auto& nonce = key.GetNonce()) {
++      site += "#" + nonce->ToString();
++    }
++    return site;
++  }
++  if (auto* worklet = DynamicTo<WorkletGlobalScope>(&context)) {
++    if (worklet->IsMainThreadWorkletGlobalScope()) {
++      if (LocalFrame* frame = worklet->GetFrame()) {
++        if (LocalDOMWindow* window = frame->DomWindow()) {
++          return SiteFor(*window);
++        }
++      }
++    }
++  }
++  if (auto* worker = DynamicTo<WorkerGlobalScope>(&context)) {
++    if (const SecurityOrigin* top = worker->top_level_frame_security_origin()) {
++      return BlinkSchemefulSite(scoped_refptr<const SecurityOrigin>(top))
++          .Serialize()
++          .Utf8();
++    }
++  }
++  return BlinkSchemefulSite(
++             scoped_refptr<const SecurityOrigin>(context.GetSecurityOrigin()))
++      .Serialize()
++      .Utf8();
++}
++
++inline uint64_t lfsr_next(uint64_t v) {
++  constexpr uint64_t zero = 0;
++  return ((v >> 1) | (((v << 62) ^ (v << 61)) & (~(~zero << 63) << 62)));
++}
++
++}  // namespace
++
++const char AlterFarbling::kSupplementName[] = "AlterFarbling";
++
++// static
++AlterFarbling* AlterFarbling::From(ExecutionContext* context) {
++  if (!context) {
++    return nullptr;
++  }
++  const SessionConfig& config = Config();
++  if (!config.key || IsExempt(context->GetSecurityOrigin())) {
++    return nullptr;
++  }
++  if (auto* farbling =
++          Supplement<ExecutionContext>::From<AlterFarbling>(*context)) {
++    return farbling;
++  }
++  std::string site = SiteFor(*context);
++  // "https://bbc.co.uk#nonce" → "bbc.co.uk": off where you turned it off.
++  if (!config.off_sites.empty()) {
++    std::string host = site.substr(0, site.find('#'));
++    if (size_t scheme = host.find("://"); scheme != std::string::npos) {
++      host = host.substr(scheme + 3);
++    }
++    if (std::ranges::find(config.off_sites, host) != config.off_sites.end()) {
++      return nullptr;
++    }
++  }
++  auto token = crypto::hmac::SignSha256(*config.key, base::as_byte_span(site));
++  auto* farbling =
++      MakeGarbageCollected<AlterFarbling>(*context, token, config.level);
++  Supplement<ExecutionContext>::ProvideTo(*context, farbling);
++  return farbling;
++}
++
++AlterFarbling::AlterFarbling(ExecutionContext& context,
++                             const std::array<uint8_t, 32>& token,
++                             AlterFarblingLevel level)
++    : Supplement<ExecutionContext>(context), token_(token), level_(level) {
++  // 0.999 to 1.0, as Brave: inaudible, but every sum over the samples moves.
++  AlterFarblingPRNG prng(Seed(AlterFarbleKey::kAudio));
++  audio_factor_ = static_cast<float>(0.999 + prng.NextDouble() / 1000);
++}
++
++uint64_t AlterFarbling::Seed(AlterFarbleKey key) const {
++  auto half = base::span(token_).first<16u>();
++  uint64_t a = base::U64FromNativeEndian(half.first<8u>());
++  uint64_t b = base::U64FromNativeEndian(half.last<8u>());
++  return a ^ (b * 0x9e3779b97f4a7c15ull) ^ static_cast<uint64_t>(key);
++}
++
++void AlterFarbling::PerturbPixels(base::span<uint8_t> rgba) const {
++  const size_t pixel_count = rgba.size() / 4;
++  if (pixel_count == 0) {
++    return;
++  }
++  // Which pixels: from the token and the canvas contents (Brave's scheme), so
++  // a drawing reads back identically within a site.
++  auto canvas_key = crypto::hmac::SignSha256(token_, rgba);
++  uint64_t v = base::U64FromNativeEndian(base::span(canvas_key).first<8u>());
++  const int bits_per_byte = level_ == AlterFarblingLevel::kStrict ? 16 : 8;
++  for (uint8_t key : canvas_key) {
++    uint8_t bit = key;
++    for (int j = 0; j < bits_per_byte; j++) {
++      if (j % 8 == 0) {
++        bit = key;
++      }
++      const uint8_t channel = v % 3;  // R, G or B; alpha is left alone
++      const size_t index = 4 * (v % pixel_count) + channel;
++      rgba[index] ^= (bit & 0x1);
++      bit >>= 1;
++      v = lfsr_next(v);
++    }
++  }
++}
++
++void AlterFarbling::FarbleAudio(base::span<float> samples) const {
++  if (level_ == AlterFarblingLevel::kStrict) {
++    // Inaudible noise on top (about -140 dB), so even silence reads back
++    // differently per site.
++    AlterFarblingPRNG prng(Seed(AlterFarbleKey::kAudio));
++    for (float& s : samples) {
++      s = s * audio_factor_ +
++          static_cast<float>((prng.NextDouble() - 0.5) * 2e-7);
++    }
++    return;
++  }
++  for (float& s : samples) {
++    s *= audio_factor_;
++  }
++}
++
++// Common GPUs on each system, written as Chromium's ANGLE reports them.
++const char* AlterFarbling::GpuVendor() {
++#if BUILDFLAG(IS_MAC)
++  return "Google Inc. (Apple)";
++#else
++  return "Google Inc. (Intel)";
++#endif
++}
++
++const char* AlterFarbling::GpuRenderer() {
++#if BUILDFLAG(IS_MAC)
++  return "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)";
++#elif BUILDFLAG(IS_WIN)
++  return "ANGLE (Intel, Intel(R) UHD Graphics 620 (0x00003EA0) Direct3D11 "
++         "vs_5_0 ps_5_0, D3D11)";
++#else
++  return "ANGLE (Intel, Mesa Intel(R) UHD Graphics 620 (KBL GT2), OpenGL 4.6)";
++#endif
++}
++
++void AlterFarbling::Trace(Visitor* visitor) const {
++  Supplement<ExecutionContext>::Trace(visitor);
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/core/frame/alter_farbling.h b/third_party/blink/renderer/core/frame/alter_farbling.h
+new file mode 100644
+index 0000000000..42a16057ef
+--- /dev/null
++++ b/third_party/blink/renderer/core/frame/alter_farbling.h
+@@ -0,0 +1,103 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * Alter's fingerprinting defences ("farbling"), after Brave's
++ * brave_session_cache (Copyright (c) 2020 The Brave Authors). */
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_CORE_FRAME_ALTER_FARBLING_H_
++#define THIRD_PARTY_BLINK_RENDERER_CORE_FRAME_ALTER_FARBLING_H_
++
++#include <array>
++#include <cstdint>
++
++#include "base/containers/span.h"
++#include "third_party/blink/renderer/core/core_export.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
++#include "third_party/blink/renderer/platform/supplementable.h"
++
++namespace blink {
++
++// How hard a page's fingerprinting reads are disturbed. Standard keeps every
++// value plausible and pages working; Strict trades some compatibility away.
++enum class AlterFarblingLevel { kOff, kStandard, kStrict };
++
++// Keys for values farbled independently of each other from the same token.
++enum class AlterFarbleKey : uint64_t {
++  kNone = 0,
++  kAudio,
++  kCanvas,
++  kWebGL,
++  kNavigator,
++  kScreen,
++  kFonts,
++  kDevices,
++};
++
++// One per execution context (window, worker, worklet). The token comes from
++// the session key Alter hands each renderer (--alter-farbling-key, new every
++// launch) and the top-level site, so a site sees the same values for the
++// whole session, different sites see different ones, and a new session
++// starts fresh. Without the switch (stock shell, tests) everything is off.
++class CORE_EXPORT AlterFarbling final : public GarbageCollected<AlterFarbling>,
++                                        public Supplement<ExecutionContext> {
++ public:
++  static const char kSupplementName[];
++
++  // Null when protection is off for this context (no key, off by switch, or
++  // a page that is ours or local: file:, extensions, devtools, chrome:).
++  static AlterFarbling* From(ExecutionContext* context);
++
++  AlterFarbling(ExecutionContext& context,
++                const std::array<uint8_t, 32>& token,
++                AlterFarblingLevel level);
++
++  AlterFarblingLevel level() const { return level_; }
++
++  // A seed for one surface: same site, session and key give the same seed.
++  uint64_t Seed(AlterFarbleKey key) const;
++
++  // Flips the lowest bit of a few colour channels in RGBA8 pixel data. Which
++  // pixels depends on the token and on the pixels themselves, so the same
++  // drawing reads back the same way on a site, and differently elsewhere.
++  void PerturbPixels(base::span<uint8_t> rgba) const;
++
++  // Audio samples a page reads: scaled by a factor just under 1, plus
++  // inaudible noise in Strict. Inaudible, so it may apply in place.
++  void FarbleAudio(base::span<float> samples) const;
++  float AudioFactor() const { return audio_factor_; }
++
++  // The GPU a page is told about (WEBGL_debug_renderer_info): the same common
++  // one for every Effie on this system, instead of this machine's own.
++  static const char* GpuVendor();
++  static const char* GpuRenderer();
++
++  void Trace(Visitor* visitor) const override;
++
++ private:
++  std::array<uint8_t, 32> token_;
++  AlterFarblingLevel level_;
++  float audio_factor_;
++};
++
++// A small deterministic generator for farbled values (splitmix64).
++class AlterFarblingPRNG {
++ public:
++  explicit AlterFarblingPRNG(uint64_t seed) : state_(seed) {}
++  uint64_t operator()() {
++    uint64_t z = (state_ += 0x9e3779b97f4a7c15ull);
++    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
++    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
++    return z ^ (z >> 31);
++  }
++  // A double in [0, 1).
++  double NextDouble() { return ((*this)() >> 11) * 0x1.0p-53; }
++
++ private:
++  uint64_t state_;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_CORE_FRAME_ALTER_FARBLING_H_
+diff --git a/third_party/blink/renderer/core/frame/build.gni b/third_party/blink/renderer/core/frame/build.gni
+index e5536f2fcf..b9a3a5ff04 100644
+--- a/third_party/blink/renderer/core/frame/build.gni
++++ b/third_party/blink/renderer/core/frame/build.gni
+@@ -5,6 +5,8 @@
+ import("//third_party/blink/renderer/config.gni")
+ 
+ blink_core_sources_frame = [
++  "alter_farbling.cc",
++  "alter_farbling.h",
+   "animation_frame_timing_monitor.cc",
+   "animation_frame_timing_monitor.h",
+   "bar_prop.cc",

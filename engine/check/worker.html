@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Worker tracker check</title>
+<!-- A service worker fetches a tracker; window.worker says whether it got through. -->
+<pre id="out">working…</pre>
+<script>
+(async () => {
+  const reg = await navigator.serviceWorker.register("worker-sw.js");
+  await navigator.serviceWorker.ready;
+  const answer = await new Promise((done) => {
+    navigator.serviceWorker.onmessage = (e) => done(e.data);
+    (reg.active || reg.waiting || reg.installing).postMessage("https://www.google-analytics.com/analytics.js");
+    setTimeout(() => done("timed out"), 10000);
+  });
+  window.worker = answer;
+  document.getElementById("out").textContent = answer;
+})();
+</script>
